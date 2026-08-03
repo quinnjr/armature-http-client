@@ -39,6 +39,7 @@ base64 = "0.22"
 serde_urlencoded = "0.7"
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 tokio-test = "0.4"
 wiremock = "0.6"
