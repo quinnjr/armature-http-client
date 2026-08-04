@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Added
+
+- Adopted the `http_client` criterion benchmark (config, retry, circuit breaker, request building) from the root package's `benches/`. Run it with `cargo bench -p armature-http-client --bench http_client`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
+
 ### Fixed
 
 - An invalid per-request header name or value is warned about rather than dropped in silence — this had been silently stripping `bearer_auth` when a token contained a stray newline.
