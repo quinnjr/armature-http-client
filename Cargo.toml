@@ -17,7 +17,7 @@ categories = ["web-programming::http-client", "asynchronous"]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip", "brotli", "stream"] }
 
 # Async runtime
-tokio = { version = "1.52", features = ["time", "sync"] }
+tokio = { version = "1.53", features = ["time", "sync"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -31,18 +31,18 @@ tracing = "0.1"
 
 # Utilities
 url = "2.5"
-http = "1.4"
+http = "1.5"
 bytes = "1.12"
 futures = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
-base64 = "0.22"
+base64 = "0.23"
 serde_urlencoded = "0.7"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 tokio-test = "0.4"
 wiremock = "0.6"
 
