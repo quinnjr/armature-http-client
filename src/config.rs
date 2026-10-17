@@ -1,13 +1,25 @@
 //! HTTP client configuration.
 
 use crate::circuit_breaker::CircuitBreakerConfig;
+use crate::egress::EgressPolicy;
 use crate::retry::RetryConfig;
 use std::time::Duration;
+
+/// Default cap on a response body, after decompression: 10 MiB.
+pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
 /// HTTP client configuration.
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
     /// Base URL for all requests.
+    ///
+    /// When set, request URLs are treated as paths *relative to the base*:
+    /// `base_url("https://api.example.com/v1")` plus `get("/users")` requests
+    /// `https://api.example.com/v1/users`. A request URL that carries its own
+    /// scheme or authority (`https://other/`, `//other/`) is rejected, and so
+    /// is one whose `..` segments would climb out of the base path — a path
+    /// built from user input can therefore never redirect the request to a
+    /// different host (such as `//169.254.169.254/`).
     pub base_url: Option<String>,
     /// Default request timeout.
     pub timeout: Duration,
@@ -29,10 +41,36 @@ pub struct HttpClientConfig {
     pub gzip: bool,
     /// Enable brotli compression.
     pub brotli: bool,
-    /// Follow redirects.
+    /// Follow redirects. **Default: `false`.**
+    ///
+    /// Off by default because a followed redirect re-sends the request's
+    /// headers to wherever the server points: reqwest strips `Authorization`
+    /// and `Cookie` on a cross-host hop, but not custom credentials such as
+    /// `X-Api-Key`. When enabled, a redirect that downgrades https to http is
+    /// always refused, and a redirect to a different origin is refused unless
+    /// [`allow_cross_origin_redirects`](Self::allow_cross_origin_redirects)
+    /// is also set.
     pub follow_redirects: bool,
     /// Maximum redirects to follow.
     pub max_redirects: usize,
+    /// Allow redirects to a different origin (scheme, host or port) than the
+    /// original request. **Default: `false`.** Custom headers set on the
+    /// request are forwarded to the new origin, so leave this off for clients
+    /// that carry credentials in custom headers.
+    pub allow_cross_origin_redirects: bool,
+    /// Refuse any request (and redirect hop) that is not `https`.
+    pub https_only: bool,
+    /// Maximum response body size in bytes, measured on the *decoded* body
+    /// (after gzip/brotli decompression), enforced while streaming. Default
+    /// [`DEFAULT_MAX_RESPONSE_SIZE`] (10 MiB). Exceeding it fails the request
+    /// with [`HttpClientError::ResponseTooLarge`](crate::HttpClientError::ResponseTooLarge).
+    pub max_response_size: usize,
+    /// Optional SSRF guard for clients whose targets are not fully trusted.
+    ///
+    /// When set, every request URL and redirect hop must pass
+    /// [`EgressPolicy::check_url`], DNS answers are vetted at connect time,
+    /// and proxies are disabled. See [`crate::egress`].
+    pub egress: Option<EgressPolicy>,
 }
 
 impl Default for HttpClientConfig {
@@ -49,8 +87,12 @@ impl Default for HttpClientConfig {
             user_agent: format!("armature-http-client/{}", env!("CARGO_PKG_VERSION")),
             gzip: true,
             brotli: true,
-            follow_redirects: true,
+            follow_redirects: false,
             max_redirects: 10,
+            allow_cross_origin_redirects: false,
+            https_only: false,
+            max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+            egress: None,
         }
     }
 }
@@ -146,6 +188,30 @@ impl HttpClientConfigBuilder {
     /// Set the maximum number of redirects to follow.
     pub fn max_redirects(mut self, max: usize) -> Self {
         self.config.max_redirects = max;
+        self
+    }
+
+    /// Allow or refuse redirects to a different origin (default: refuse).
+    pub fn allow_cross_origin_redirects(mut self, allow: bool) -> Self {
+        self.config.allow_cross_origin_redirects = allow;
+        self
+    }
+
+    /// Refuse any request that is not `https`.
+    pub fn https_only(mut self, enable: bool) -> Self {
+        self.config.https_only = enable;
+        self
+    }
+
+    /// Set the maximum decoded response body size in bytes.
+    pub fn max_response_size(mut self, max: usize) -> Self {
+        self.config.max_response_size = max;
+        self
+    }
+
+    /// Guard every request with an [`EgressPolicy`] (SSRF protection).
+    pub fn egress_policy(mut self, policy: EgressPolicy) -> Self {
+        self.config.egress = Some(policy);
         self
     }
 

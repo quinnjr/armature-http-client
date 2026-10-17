@@ -68,6 +68,27 @@ let config = HttpClientConfig::builder()
 let client = HttpClient::new(config);
 ```
 
+## Security Defaults
+
+- Redirects are not followed unless `.follow_redirects(true)`; https→http hops are always
+  refused and cross-origin hops need `.allow_cross_origin_redirects(true)`.
+- Paths are appended to `base_url` and may not escape it (no scheme/authority, no `..`).
+- Response bodies are capped on their decoded size (`max_response_size`, 10 MiB).
+
+For URLs that users can influence, enable the SSRF guard: https only, no loopback,
+private, link-local/metadata or special-purpose addresses, checked again on every DNS
+answer at connect time.
+
+```rust
+use armature_http_client::{EgressPolicy, HttpClient, HttpClientConfig};
+
+let client = HttpClient::new(
+    HttpClientConfig::builder()
+        .egress_policy(EgressPolicy::strict())
+        .build(),
+);
+```
+
 ## License
 
 MIT OR Apache-2.0

@@ -67,6 +67,25 @@ pub enum HttpClientError {
     )]
     StreamingBodyNotRetryable,
 
+    /// The response body exceeded the configured
+    /// [`max_response_size`](crate::HttpClientConfig::max_response_size)
+    /// (measured after decompression).
+    #[error("Response body exceeds the {limit}-byte limit")]
+    ResponseTooLarge {
+        /// The configured limit in bytes.
+        limit: usize,
+    },
+
+    /// The request (or a redirect hop, or a DNS answer) was refused by the
+    /// configured [`EgressPolicy`](crate::egress::EgressPolicy).
+    #[error("{0}")]
+    Egress(#[from] crate::egress::EgressError),
+
+    /// A redirect was refused (https→http downgrade, cross-origin hop, or
+    /// too many hops).
+    #[error("Redirect refused: {0}")]
+    RedirectRefused(String),
+
     /// Underlying HTTP client error.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
