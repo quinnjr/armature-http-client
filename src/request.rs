@@ -169,16 +169,26 @@ impl<'a> RequestBuilder<'a> {
         self.header("Authorization", format!("Basic {}", encoded))
     }
 
-    /// Build the URL with query parameters.
+    /// Build the URL with query parameters, and apply the client's URL
+    /// policy (`base_url` confinement, `https_only`, egress guard).
     fn build_url(&self) -> Result<url::Url> {
-        let mut url = if let Some(base) = &self.client.config().base_url {
-            let base =
-                url::Url::parse(base).map_err(|e| HttpClientError::InvalidUrl(e.to_string()))?;
-            base.join(&self.url)
-                .map_err(|e| HttpClientError::InvalidUrl(e.to_string()))?
+        let config = self.client.config();
+        let mut url = if let Some(base) = &config.base_url {
+            resolve_against_base(base, &self.url)?
         } else {
             url::Url::parse(&self.url).map_err(|e| HttpClientError::InvalidUrl(e.to_string()))?
         };
+
+        if config.https_only && url.scheme() != "https" {
+            return Err(HttpClientError::InvalidUrl(
+                "only https URLs are allowed (https_only is set)".to_string(),
+            ));
+        }
+        // IP-literal hosts are dialed without a DNS lookup, so the guarded
+        // resolver never sees them: the literal check has to happen here.
+        if let Some(egress) = &config.egress {
+            egress.check_url(&url)?;
+        }
 
         // Add query parameters
         if !self.query.is_empty() {
@@ -233,6 +243,132 @@ impl<'a> RequestBuilder<'a> {
         };
 
         self.client.execute(spec).await
+    }
+}
+
+/// Resolve a request path against `base`, refusing anything that would leave
+/// it.
+///
+/// `Url::join` is the wrong tool here: it gives a scheme-relative reference
+/// (`//169.254.169.254/latest`) or an absolute URL (`https://evil/`) priority
+/// over the base, so a path assembled from user input could re-target the
+/// request at any host. Instead, the path is *appended* to the base path
+/// (one `/` between them, as axios/NestJS `HttpModule` do), anything that
+/// names its own scheme or authority is rejected up front, and the result is
+/// re-checked: same origin as the base, and still under the base path after
+/// `.`/`..` (including `%2e%2e`) normalization.
+fn resolve_against_base(base: &str, path: &str) -> Result<url::Url> {
+    let invalid = |msg: &str| HttpClientError::InvalidUrl(msg.to_string());
+
+    let mut base = url::Url::parse(base).map_err(|e| HttpClientError::InvalidUrl(e.to_string()))?;
+    if base.cannot_be_a_base() {
+        return Err(invalid("base_url cannot be used as a base"));
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+
+    // The URL parser drops ASCII tab/newline anywhere and treats `\` as `/`
+    // in special schemes, so check the path the way the parser will see it.
+    let cleaned: String = path
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_start_matches(|c: char| c.is_ascii_control() || c == ' ');
+    if cleaned.starts_with("//") {
+        return Err(invalid(
+            "request URL must be a path when base_url is set (scheme-relative URL given)",
+        ));
+    }
+    // `scheme:` before any `/`, `?` or `#` makes it an absolute URL.
+    let before_path = cleaned.split(['/', '?', '#']).next().unwrap_or("");
+    if before_path.contains(':') {
+        return Err(invalid(
+            "request URL must be a path when base_url is set (absolute URL given)",
+        ));
+    }
+
+    let base_str = base.as_str().trim_end_matches('/');
+    let joined = format!("{base_str}/{}", cleaned.trim_start_matches('/'));
+    let url = url::Url::parse(&joined).map_err(|e| HttpClientError::InvalidUrl(e.to_string()))?;
+
+    let mut base_dir = base.path().to_string();
+    if !base_dir.ends_with('/') {
+        base_dir.push('/');
+    }
+    let mut path_dir = url.path().to_string();
+    if !path_dir.ends_with('/') {
+        path_dir.push('/');
+    }
+    if url.origin() != base.origin() || !path_dir.starts_with(&base_dir) {
+        return Err(invalid("request path escapes base_url"));
+    }
+    Ok(url)
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::resolve_against_base;
+
+    fn ok(base: &str, path: &str) -> String {
+        resolve_against_base(base, path).unwrap().to_string()
+    }
+
+    fn rejected(base: &str, path: &str) -> bool {
+        resolve_against_base(base, path).is_err()
+    }
+
+    #[test]
+    fn paths_are_appended_to_the_base_path() {
+        assert_eq!(
+            ok("https://api.example.com", "/users"),
+            "https://api.example.com/users"
+        );
+        assert_eq!(
+            ok("https://api.example.com/v1", "/users"),
+            "https://api.example.com/v1/users"
+        );
+        assert_eq!(
+            ok("https://api.example.com/v1/", "users"),
+            "https://api.example.com/v1/users"
+        );
+        assert_eq!(
+            ok("https://api.example.com/v1", "users/1?x=2#f"),
+            "https://api.example.com/v1/users/1?x=2#f"
+        );
+        assert_eq!(
+            ok("https://api.example.com/v1", ""),
+            "https://api.example.com/v1/"
+        );
+        // `..` that stays inside the base is fine.
+        assert_eq!(
+            ok("https://api.example.com/v1", "a/../b"),
+            "https://api.example.com/v1/b"
+        );
+    }
+
+    #[test]
+    fn scheme_relative_and_absolute_urls_are_rejected() {
+        let base = "https://api.example.com/v1";
+        assert!(rejected(base, "//169.254.169.254/latest/meta-data/"));
+        assert!(rejected(base, "\\\\169.254.169.254/latest"));
+        assert!(rejected(base, "/\\169.254.169.254/latest"));
+        assert!(rejected(base, "\t//169.254.169.254/"));
+        assert!(rejected(base, "/\t/169.254.169.254/"));
+        assert!(rejected(base, "https://evil.example/"));
+        assert!(rejected(base, "http:evil.example"));
+        assert!(rejected(base, "file:///etc/passwd"));
+        assert!(rejected(base, " //evil.example/"));
+    }
+
+    #[test]
+    fn dot_dot_cannot_climb_out_of_the_base_path() {
+        let base = "https://api.example.com/v1/";
+        assert!(rejected(base, "../admin"));
+        assert!(rejected(base, "/../admin"));
+        assert!(rejected(base, "a/../../admin"));
+        assert!(rejected(base, "%2e%2e/admin"));
+        assert!(rejected(base, ".%2E/admin"));
     }
 }
 

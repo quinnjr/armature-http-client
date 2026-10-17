@@ -10,7 +10,12 @@
 //! - **Timeouts**: Per-request and global timeout configuration
 //! - **Interceptors**: Request/response transformation and logging
 //! - **Connection Pooling**: Efficient connection reuse
-//! - **Compression**: Automatic gzip/brotli support
+//! - **Compression**: Automatic gzip/brotli support, with a decoded-size cap
+//!   (`max_response_size`, 10 MiB by default) against decompression bombs
+//! - **SSRF guard**: optional [`EgressPolicy`] for requests whose targets are
+//!   not fully trusted (see [`egress`])
+//! - **Safe defaults**: redirects are off by default; when enabled, https→http
+//!   downgrades and cross-origin hops are refused
 //!
 //! ## Quick Start
 //!
@@ -62,6 +67,7 @@
 mod circuit_breaker;
 mod client;
 mod config;
+pub mod egress;
 mod error;
 mod interceptor;
 mod request;
@@ -70,7 +76,8 @@ mod retry;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use client::HttpClient;
-pub use config::{HttpClientConfig, HttpClientConfigBuilder};
+pub use config::{DEFAULT_MAX_RESPONSE_SIZE, HttpClientConfig, HttpClientConfigBuilder};
+pub use egress::{EgressError, EgressPolicy};
 pub use error::{HttpClientError, Result};
 pub use interceptor::{
     AuthInterceptor, Interceptor, LoggingInterceptor, RateLimitInterceptor, RequestInterceptor,
