@@ -20,11 +20,39 @@ impl Response {
     /// Returns an error if the response body cannot be fully read (e.g. the
     /// connection is reset mid-body) instead of silently substituting an
     /// empty body on an otherwise-successful status.
-    pub(crate) async fn from_reqwest(response: reqwest::Response) -> Result<Self> {
+    ///
+    /// The body is read chunk by chunk and the read is abandoned as soon as
+    /// more than `max_size` bytes have arrived. The chunks are the *decoded*
+    /// bytes (reqwest decompresses gzip/brotli transparently), so a small
+    /// compressed body that inflates to gigabytes is cut off at the limit
+    /// instead of being buffered in full.
+    pub(crate) async fn from_reqwest(
+        mut response: reqwest::Response,
+        max_size: usize,
+    ) -> Result<Self> {
         let status = response.status();
         let headers = response.headers().clone();
         let url = response.url().clone();
-        let body = response.bytes().await.map_err(HttpClientError::Http)?;
+
+        let too_large = || HttpClientError::ResponseTooLarge { limit: max_size };
+        // A declared length over the limit fails before any body is read. (A
+        // decompressed body has no reliable length up front; the streaming
+        // check below is what actually enforces the cap.)
+        if response
+            .content_length()
+            .is_some_and(|len| len > max_size as u64)
+        {
+            return Err(too_large());
+        }
+
+        let mut body = bytes::BytesMut::new();
+        while let Some(chunk) = response.chunk().await.map_err(HttpClientError::Http)? {
+            if body.len() + chunk.len() > max_size {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = body.freeze();
 
         Ok(Self {
             status,

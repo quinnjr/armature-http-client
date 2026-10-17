@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::{
-    CircuitBreaker, HttpClientConfig, HttpClientError, Interceptor, RequestBuilder,
+    CircuitBreaker, EgressError, HttpClientConfig, HttpClientError, Interceptor, RequestBuilder,
     RequestInterceptor, Response, ResponseInterceptor, Result, RetryStrategy,
 };
 
@@ -70,11 +70,20 @@ impl HttpClient {
         if config.brotli {
             builder = builder.brotli(true);
         }
-        if config.follow_redirects {
-            builder = builder.redirect(reqwest::redirect::Policy::limited(config.max_redirects));
-        } else {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
+        // The egress guard installs its vetting resolver and disables proxies
+        // (a proxy would resolve the target itself, out of the guard's sight).
+        // It also sets redirects to none; the policy below replaces that, and
+        // re-runs the guard's literal checks on every hop.
+        if let Some(egress) = &config.egress {
+            builder = egress.apply(builder);
         }
+        let https_only = config.https_only
+            || config
+                .egress
+                .as_ref()
+                .is_some_and(|e| !e.allows_http() && !e.allows_loopback());
+        builder = builder.https_only(https_only);
+        builder = builder.redirect(redirect_policy(&config));
 
         let inner = builder.build().expect("Failed to build HTTP client");
 
@@ -360,25 +369,36 @@ impl HttpClient {
     /// a run of failing status codes, not just transport errors.
     async fn execute_once(&self, request: Request) -> Result<Response> {
         match self.inner.execute(request).await {
-            Ok(response) => match Response::from_reqwest(response).await {
-                Ok(response) => {
-                    if let Some(cb) = &self.circuit_breaker {
-                        if is_failure_status(response.status()) {
-                            cb.record_failure();
-                        } else {
-                            cb.record_success();
+            Ok(response) => {
+                match Response::from_reqwest(response, self.config.max_response_size).await {
+                    Ok(response) => {
+                        if let Some(cb) = &self.circuit_breaker {
+                            if is_failure_status(response.status()) {
+                                cb.record_failure();
+                            } else {
+                                cb.record_success();
+                            }
                         }
+                        Ok(response)
                     }
-                    Ok(response)
-                }
-                Err(e) => {
-                    if let Some(cb) = &self.circuit_breaker {
-                        cb.record_failure();
+                    Err(e) => {
+                        if let Some(cb) = &self.circuit_breaker {
+                            cb.record_failure();
+                        }
+                        Err(e)
                     }
-                    Err(e)
                 }
-            },
+            }
             Err(e) => {
+                // A policy refusal says nothing about the upstream's health,
+                // so it must not trip the circuit breaker, and it is never
+                // retryable.
+                if let Some(refused) = EgressError::find_in(&e) {
+                    return Err(HttpClientError::Egress(refused.clone()));
+                }
+                if let Some(refused) = find_redirect_refusal(&e) {
+                    return Err(HttpClientError::RedirectRefused(refused.to_string()));
+                }
                 if let Some(cb) = &self.circuit_breaker {
                     cb.record_failure();
                 }
@@ -386,6 +406,77 @@ impl HttpClient {
             }
         }
     }
+}
+
+/// Why a redirect hop was refused by [`redirect_policy`].
+#[derive(Debug)]
+struct RedirectRefusal(&'static str);
+
+impl std::fmt::Display for RedirectRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RedirectRefusal {}
+
+fn find_redirect_refusal<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a RedirectRefusal> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(found) = e.downcast_ref::<RedirectRefusal>() {
+            return Some(found);
+        }
+        current = e.source();
+    }
+    None
+}
+
+/// Build the redirect policy for `config`.
+///
+/// Redirects are off unless `follow_redirects` is set. When on, every hop is
+/// checked: an https→http downgrade is always refused (it would put the
+/// request, headers included, on the wire in clear text), a hop to a
+/// different origin than the original request is refused unless
+/// `allow_cross_origin_redirects` is set (reqwest strips `Authorization` and
+/// `Cookie` on such hops but forwards every custom header), and with an
+/// [`EgressPolicy`](crate::egress::EgressPolicy) the hop's URL must pass its
+/// literal checks — IP-literal targets never reach the guarded resolver.
+fn redirect_policy(config: &HttpClientConfig) -> reqwest::redirect::Policy {
+    if !config.follow_redirects {
+        return reqwest::redirect::Policy::none();
+    }
+    let max = config.max_redirects;
+    let cross_origin = config.allow_cross_origin_redirects;
+    let https_only = config.https_only;
+    let egress = config.egress.clone();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > max {
+            return attempt.error(RedirectRefusal("too many redirects"));
+        }
+        let next = attempt.url();
+        let Some(prev) = attempt.previous().last() else {
+            return attempt.follow();
+        };
+        if (prev.scheme() == "https" || https_only) && next.scheme() != "https" {
+            return attempt.error(RedirectRefusal("https to http downgrade"));
+        }
+        if !cross_origin
+            && attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.origin() != next.origin())
+        {
+            return attempt.error(RedirectRefusal("cross-origin redirect"));
+        }
+        if let Some(egress) = &egress
+            && let Err(e) = egress.check_url(next)
+        {
+            return attempt.error(e);
+        }
+        attempt.follow()
+    })
 }
 
 /// Whether a response status should count as a circuit-breaker failure.
