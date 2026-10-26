@@ -35,7 +35,7 @@ http = "1.5"
 bytes = "1.12"
 futures = "0.3"
 async-trait = "0.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 base64 = "0.23"
 serde_urlencoded = "0.7"
 
